@@ -1,0 +1,89 @@
+"""Trajectory persistence: save an agent run's events as structured JSONL.
+
+The improvement pipeline needs "how the agent actually behaved" as evidence
+(tool calls, errors, token use). Our event stream is otherwise ephemeral, so
+`log_trajectory` tees each event to a per-project JSONL trace file while passing
+it through to the normal consumer. The Orchestrator later reads these traces to
+ground proposals in concrete evidence.
+
+Records only evidence-bearing events (tool_result / usage / done / error) and
+skips text_delta (noisy). Stored under ~/.meta-improve/traces/<project_key>/, isolated
+per project — reusing snapshot's project key so both agree on "which project".
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from ..snapshot.service import _project_key
+
+_MAX_CONTENT = 2000  # truncate tool output in traces to keep them small
+
+
+def _trace_dir(cwd: str | Path, store_root: str | Path | None = None) -> Path:
+    root = Path(store_root or Path.home() / ".meta-improve" / "traces")
+    return root / _project_key(Path(cwd).resolve())
+
+
+async def log_trajectory(
+    events: AsyncIterator[dict[str, Any]],
+    *,
+    cwd: str,
+    session_id: str | None = None,
+    store_root: str | Path | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    # tee: write each evidence-bearing event to the trace file, re-yield everything.
+    session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = _trace_dir(cwd, store_root) / f"{session_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        async for event in events:
+            record = _record(event, session_id)
+            if record is not None:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+            yield event  # pass through to the original consumer
+
+
+def _record(event: dict[str, Any], session_id: str) -> dict[str, Any] | None:
+    etype = event.get("type")
+    base = {"ts": datetime.now(UTC).isoformat(), "session_id": session_id, "type": etype}
+    if etype == "tool_result":
+        content = str(event.get("content") or "")
+        return base | {
+            "name": event.get("name"),
+            "is_error": bool(event.get("is_error")),
+            "content": content[:_MAX_CONTENT],
+        }
+    if etype == "usage":
+        return base | {"usage": event.get("usage")}
+    if etype == "done":
+        return base | {"turns": event.get("turns"), "total_tokens": event.get("total_tokens")}
+    if etype == "error":
+        return base | {"error": str(event.get("error"))}
+    return None  # skip text_delta and anything without evidence value
+
+
+def load_trajectory(
+    cwd: str, session_id: str, store_root: str | Path | None = None
+) -> list[dict[str, Any]]:
+    path = _trace_dir(cwd, store_root) / f"{session_id}.jsonl"
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def list_trajectories(cwd: str, store_root: str | Path | None = None) -> list[str]:
+    d = _trace_dir(cwd, store_root)
+    return sorted((p.stem for p in d.glob("*.jsonl")), reverse=True) if d.exists() else []
